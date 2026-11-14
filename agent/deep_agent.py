@@ -8,7 +8,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import aiohttp
 from deepagents import create_deep_agent
@@ -23,6 +23,7 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 from agent.tools.emergency_tools import dispatch_emergency_call, lookup_emergency_contacts
+from agent.cv_analyzer import RoboflowCVAnalyzer
 
 
 # --- 1. STATES & DATA STRUCTURES ---
@@ -37,13 +38,20 @@ class AgentState(Enum):
 
 @dataclass
 class AlertEvent:
-    source: str                                     # "vision" or "audio"
-    trigger_reason: str                             # e.g., "horizontal_pose_3s" or "keyword:help"
-    confidence: float                               # Local elementary confidence (0.0 - 1.0)
-    frames_jpeg: list[bytes] = field(default_factory=list)  # Multi-frame sequence
-    frame_jpeg: Optional[bytes] = None              # Optional single-frame fallback
+    source: str
+    trigger_reason: str
+    confidence: float
+    source_frames_jpeg: list[bytes] = field(default_factory=list)    # Original frames
+    skeleton_frames_jpeg: list[bytes] = field(default_factory=list)  # Skeleton frames
+    analyzed_frames_jpeg: list[bytes] = field(default_factory=list)  # Frames output by custom CV model
+    cv_model_report: Optional[dict[str, Any]] = None                 # Output metrics from custom CV model
     transcript: Optional[str] = None
     timestamp: float = field(default_factory=time.time)
+
+    @property
+    def frames_jpeg(self) -> list[bytes]:
+        """Backward-compatible alias for source_frames_jpeg."""
+        return self.source_frames_jpeg
 
 
 class EmergencyDecision(BaseModel):
@@ -65,7 +73,7 @@ class DeepAgent:
 
         # 1. Official Google Gen AI SDK client (Fast Multimodal Frame + Audio Triage)
         self.gemini_client = genai.Client(api_key=api_key)
-        self.model_id = "gemini-2.5-flash"
+        self.model_id = "gemini-3.8-flash"
 
         # 2. LangChain DeepAgent (Autonomous Contact Lookup & Emergency Dispatch)
         self.llm = ChatGoogleGenerativeAI(
@@ -87,13 +95,18 @@ class DeepAgent:
 
         self.frontend_url = frontend_url
         self.emergency_webhook = emergency_webhook
+        self.cv_analyzer = RoboflowCVAnalyzer()
 
         # Rolling ring-buffer of recent camera frames (populated by Vision Subagent)
         # Allows audio-only triggers ("Help!") to still attach visual context!
         self.latest_frames: deque[bytes] = deque(maxlen=4)
 
-        # Evidence frames and session tracking for the sanity-check frontend
-        self.evidence_frames: list[bytes] = []
+        # Evidence frame buffers and session tracking for the sanity-check frontend
+        self.source_evidence_frames: list[bytes] = []
+        self.skeleton_evidence_frames: list[bytes] = []
+        self.analyzed_evidence_frames: list[bytes] = []
+        self.last_cv_report: Optional[dict[str, Any]] = None
+
         self.response_timeout_sec = 8.0
         self._active_challenge_id: Optional[str] = None
         self._last_triage_reasoning: str = ""
@@ -105,6 +118,13 @@ class DeepAgent:
                 self.event_queue.get_nowait()
             except asyncio.QueueEmpty:
                 break
+
+    def _clear_evidence(self):
+        """Resets all stored frame buffers after an incident or false alarm."""
+        self.source_evidence_frames.clear()
+        self.skeleton_evidence_frames.clear()
+        self.analyzed_evidence_frames.clear()
+        self.last_cv_report = None
 
     async def run(self):
         """Main decision loop for the Deep Agent."""
@@ -124,16 +144,28 @@ class DeepAgent:
         print(f"[DeepAgent] Trigger received from {event.source}: {event.trigger_reason}")
         self.state = AgentState.EVALUATING
 
-        # Gather sequential frames from the event, single frame, or shared camera ring-buffer
-        if event.frames_jpeg:
-            self.evidence_frames = list(event.frames_jpeg)
-        elif event.frame_jpeg:
-            self.evidence_frames = [event.frame_jpeg]
+        # 1. Gather source frames from the event or fallback to the rolling ring-buffer
+        if event.source_frames_jpeg:
+            self.source_evidence_frames = list(event.source_frames_jpeg)
         elif self.latest_frames:
-            self.evidence_frames = list(self.latest_frames)
+            self.source_evidence_frames = list(self.latest_frames)
 
-        # Query Gemini for multimodal verification across all collected frames
-        decision = await self._query_cloud_model(event, self.evidence_frames)
+        # 2. Run Roboflow CV Analyzer on the source frames if not already provided
+        if event.cv_model_report is not None:
+            self.last_cv_report = event.cv_model_report
+        elif self.source_evidence_frames:
+            self.last_cv_report = await self.cv_analyzer.analyze_frames(self.source_evidence_frames)
+            event.cv_model_report = self.last_cv_report
+
+        # 3. Choose the best frames to send to Gemini (analyzed frames first, then source frames)
+        frames_for_gemini = (
+            self.analyzed_evidence_frames
+            if self.analyzed_evidence_frames
+            else self.source_evidence_frames
+        )
+
+        # 4. Query Gemini for multimodal verification across the collected frames + CV report
+        decision = await self._query_cloud_model(event, frames_for_gemini)
         self._last_triage_reasoning = decision.get("reasoning", "Anomaly detected.")
 
         if decision.get("is_emergency") and decision.get("confidence", 0.0) >= 0.75:
@@ -141,7 +173,7 @@ class DeepAgent:
             await self._initiate_speaker_challenge()
         else:
             print(f"[DeepAgent] Gemini dismissed alert ({self._last_triage_reasoning}). Returning to MONITORING.")
-            self.evidence_frames.clear()
+            self._clear_evidence()
             self._clear_stale_events()
             self.state = AgentState.MONITORING
 
@@ -191,7 +223,7 @@ class DeepAgent:
             if any(phrase in text for phrase in ["i'm okay", "i am okay", "i'm fine", "i am fine", "all good"]):
                 print("[DeepAgent] User confirmed they are okay. Resetting.")
                 self._active_challenge_id = None
-                self.evidence_frames.clear()
+                self._clear_evidence()
                 self._clear_stale_events()
                 self.state = AgentState.MONITORING
             else:
@@ -219,7 +251,7 @@ class DeepAgent:
         await asyncio.sleep(10)
         self._clear_stale_events()
         self.mic_enabled.set()
-        self.evidence_frames.clear()
+        self._clear_evidence()
         self.state = AgentState.MONITORING
         print("[DeepAgent] System reset for next demo.")
 
@@ -227,15 +259,17 @@ class DeepAgent:
 
     async def _query_cloud_model(self, event: AlertEvent, frames: list[bytes]) -> dict:
         """
-        Sends sequential frames + sensor context to Gemini using native async (client.aio)
+        Sends sequential frames + custom CV report + audio context to Gemini using native async
         and structured Pydantic output.
         """
+        cv_report_str = json.dumps(event.cv_model_report) if event.cv_model_report else "None provided"
         prompt = (
             "You are an emergency triage vision and audio analyzer for an autonomous safety monitor. "
             f"Local sensor trigger: {event.trigger_reason}. "
+            f"Custom CV Model Report: {cv_report_str}. "
             f"Audio transcript: '{event.transcript or 'None'}'. "
-            f"Attached are {len(frames)} sequential camera frame(s) captured leading up to the alert. "
-            "Analyze the visual posture progression and audio context. "
+            f"Attached are {len(frames)} sequential frame(s) captured leading up to the alert. "
+            "Analyze the visual posture progression, the custom CV model metrics, and the audio context. "
             "Determine if a person has collapsed on the ground, appears unresponsive/injured, "
             "or is calling for help."
         )
@@ -288,9 +322,18 @@ class DeepAgent:
             final_msg = result["messages"][-1].content
             print(f"[DeepAgent] Escalation Agent Complete: {final_msg}")
         except Exception as e:
-            print(f"[DeepAgent] Escalation Agent failed ({e}), falling back to direct webhook.")
+            print(f"[DeepAgent] Escalation Agent failed ({e}), running tools directly...")
+            raw_profile = lookup_emergency_contacts.invoke({"resident_id": "default_resident"})
+            profile = json.loads(raw_profile)
+            primary_contact = profile["contacts"][0]
+            summary = f"{profile['name']} emergency: {reason} Medical notes: {profile['medical_notes']}."
+            dispatch_emergency_call.invoke({
+                "phone_number": primary_contact["phone"],
+                "contact_name": primary_contact["name"],
+                "incident_summary": summary,
+            })
             if self.emergency_webhook:
-                await self._trigger_emergency_call(reason)
+                await self._trigger_emergency_call(summary)
 
     async def _speak(self, text: str):
         """Non-blocking wrapper around Raspberry Pi TTS (espeak-ng) with Windows fallback."""
@@ -303,19 +346,20 @@ class DeepAgent:
             await proc.wait()
         except FileNotFoundError:
             # Fallback when testing on Windows laptop without espeak-ng installed
-            print(f"🔊 [TTS SPEAKER]: {text}")
+            print(f"[TTS SPEAKER]: {text}")
             await asyncio.sleep(2.0)
 
     async def _push_to_frontend(self, reason: str):
-        """Sends base64 frames and status to your sanity-check dashboard."""
+        """Sends source frames, skeleton frames, and analyzed frames to your dashboard."""
         if not self.frontend_url:
             return
         payload = {
-            "status": "EMERGENCY_DISPATCHED",
-            "reason": reason,
-            "timestamp": time.time(),
-            "frames_b64": [base64.b64encode(f).decode("utf-8") for f in self.evidence_frames],
-        }
+                    "status": "EMERGENCY_DISPATCHED",
+                    "reason": reason,
+                    "timestamp": time.time(),
+                    "source_frames_b64": [base64.b64encode(f).decode("utf-8") for f in self.source_evidence_frames],
+                    "analyzed_frames_b64": [base64.b64encode(f).decode("utf-8") for f in self.analyzed_evidence_frames],
+                }
         async with aiohttp.ClientSession() as session:
             try:
                 await session.post(
