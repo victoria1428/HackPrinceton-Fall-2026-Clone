@@ -53,7 +53,9 @@ ACOUSTIC_DISTRESS_EVENTS = ("thud", "crash", "scream", "groan", "moan", "cry", "
 NEGATION_PHRASES = ("don't need help", "do not need help", "no emergency", "not hurt")
 
 
-def _normalize_audio_input(raw_item: Union[AudioPacket, tuple, dict, str]) -> AudioPacket:
+def _normalize_audio_input(
+    raw_item: Union[AudioPacket, tuple[Any, ...], dict[str, Any], str]
+) -> AudioPacket:
     """
     Converts whatever format your teammate pushes into `raw_audio_queue`
     (AudioPacket, (str, float) tuple, dict, or plain str) into an AudioPacket.
@@ -62,16 +64,20 @@ def _normalize_audio_input(raw_item: Union[AudioPacket, tuple, dict, str]) -> Au
         return raw_item
 
     if isinstance(raw_item, tuple):
-        text = str(raw_item[0]) if len(raw_item) > 0 else ""
+        if len(raw_item) == 0:
+            return AudioPacket()
+        text = str(raw_item[0])
         conf = float(raw_item[1]) if len(raw_item) > 1 else 0.90
-        return AudioPacket(transcript=text, confidence=conf)
+        sound = str(raw_item[2]) if len(raw_item) > 2 and raw_item[2] is not None else None
+        return AudioPacket(transcript=text, confidence=conf, sound_event=sound)
 
     if isinstance(raw_item, dict):
+        raw_db = raw_item.get("decibels_db") or raw_item.get("db")
         return AudioPacket(
             transcript=str(raw_item.get("transcript") or raw_item.get("text") or ""),
             confidence=float(raw_item.get("confidence", 0.90)),
             sound_event=raw_item.get("sound_event") or raw_item.get("event"),
-            decibels_db=raw_item.get("decibels_db") or raw_item.get("db"),
+            decibels_db=float(raw_db) if raw_db is not None else None,
             timestamp=float(raw_item.get("timestamp", time.time())),
         )
 
@@ -134,7 +140,7 @@ async def audio_interpreter_loop(agent: DeepAgent, raw_audio_queue: asyncio.Queu
                         source="audio",
                         trigger_reason=trigger_desc,
                         confidence=packet.confidence,
-                        frames_jpeg=list(agent.latest_frames),
+                        source_frames_jpeg=list(agent.latest_frames),
                         transcript=packet.transcript.strip() or f"[{sound_tag}]",
                         timestamp=packet.timestamp,
                     )
@@ -148,6 +154,7 @@ async def audio_interpreter_loop(agent: DeepAgent, raw_audio_queue: asyncio.Queu
                     source="audio",
                     trigger_reason="verbal_reply",
                     confidence=packet.confidence,
+                    source_frames_jpeg=list(agent.latest_frames),
                     transcript=reply_content,
                     timestamp=packet.timestamp,
                 )

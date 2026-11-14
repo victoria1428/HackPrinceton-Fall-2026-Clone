@@ -106,50 +106,50 @@ async def run_simulation():
     # TEST SCENARIO 3: 100-Frame YOLO Fall Sequence -> Keyframe Sampling -> Dispatch
     # =========================================================================
     print("\n" + "=" * 65)
-    print("🧪 SCENARIO 3: 100-Frame YOLO Sliding Memory (25 standing -> 80 DOWN)")
+    print("🧪 SCENARIO 3: 100-Frame YOLO Sliding Memory (25 standing -> 80 fallen)")
     print("=" * 65)
 
     sim_time = time.time()
 
-    # 1. Feed 25 frames of a person standing normally (is_fallen=False, risk_score=0.10)
+    # 1. First loop uses 'i' (frames 0 to 24)
     print("\n[Sim-YOLO] Feeding 25 frames of normal standing posture (5 seconds at 5 FPS)...")
     for i in range(25):
         await raw_vision_queue.put(
             VisionFramePacket(
-                frame_jpeg=dummy_frame,
+                source_frame_jpeg=dummy_frame,
+                skeleton_frame_jpeg=dummy_frame,
                 is_fallen=False,
                 risk_score=0.10,
-                timestamp=sim_time + (i * 0.2),  # 0.2s per frame = 5 FPS
+                timestamp=sim_time + (i * 0.2),  # <-- Uses 'i' here
             )
         )
 
-    # 2. Feed 80 frames where YOLO marks the person as DOWN (is_fallen=True, risk_score=0.92)
+    # 2. Second loop defines 'frame_idx = 25 + j' (frames 25 to 104)
     print("[Sim-YOLO] Feeding 80 frames of person marked DOWN...")
     for j in range(80):
-        frame_idx = 25 + j
+        frame_idx = 25 + j  # <-- Defined right inside the 'for j' loop
         await raw_vision_queue.put(
             VisionFramePacket(
-                frame_jpeg=dummy_frame,
+                source_frame_jpeg=dummy_frame,
+                skeleton_frame_jpeg=dummy_frame,
                 is_fallen=True,
                 risk_score=0.92,
-                timestamp=sim_time + (frame_idx * 0.2),
+                timestamp=sim_time + (frame_idx * 0.2),  # <-- Uses 'frame_idx' here
             )
         )
         await asyncio.sleep(0.01)
 
-    # Wait briefly to see if Gemini confirms or dismisses the 1x1 dummy frame
-    await asyncio.sleep(3.0)
+    # Wait for VisionInterpreter to trigger DeepAgent -> Speaker Challenge -> AWAITING_RESPONSE
+    while agent.state != AgentState.AWAITING_RESPONSE:
+        await asyncio.sleep(0.2)
 
-    # Only run the simulated reply if Gemini entered AWAITING_RESPONSE
-    if agent.state == AgentState.AWAITING_RESPONSE:
-        print("\n[Sim-Mic] Person groans 'My hip hurts, help' during check-in...")
-        await asyncio.sleep(1.0)
-        await raw_audio_queue.put(("My hip hurts, help", 0.91))
+    print("\n[Sim-Mic] Person groans 'My hip hurts, help' during check-in...")
+    await asyncio.sleep(1.0)
+    await raw_audio_queue.put(("My hip hurts, help", 0.91))
 
-        while agent.state != AgentState.MONITORING:
-            await asyncio.sleep(0.5)
-    else:
-        print(f"[Test Check] Agent returned to {agent.state.name} after evaluating dummy frames.")
+    # Wait for immediate escalation + cooldown reset
+    while agent.state != AgentState.MONITORING:
+        await asyncio.sleep(0.5)
 
     print("\n✅ All 3 test scenarios (Audio Cancel, Audio Timeout, 100-Frame Vision Fall) completed!")
     agent_task.cancel()
