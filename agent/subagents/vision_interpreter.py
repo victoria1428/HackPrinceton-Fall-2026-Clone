@@ -202,26 +202,14 @@ async def vision_interpreter_loop(
                 f"keyframes ({timeline_str}) to DeepAgent."
             )
 
-            # Build AlertEvent compatible with your current DeepAgent (frames_jpeg)
-            # and populate skeleton_frames_jpeg if defined on AlertEvent
-            alert_kwargs: dict[str, Any] = {
-                "source": "vision",
-                "trigger_reason": reason,
-                "confidence": avg_conf,
-                "frames_jpeg": source_keyframes,
-                "timestamp": time.time(),
-            }
-            if "skeleton_frames_jpeg" in AlertEvent.__dataclass_fields__:
-                alert_kwargs["skeleton_frames_jpeg"] = skeleton_keyframes
-
             await agent.event_queue.put(
-              AlertEvent(
-                  source="vision",
-                  trigger_reason=reason,
-                  confidence=avg_conf,
-                  source_frames_jpeg=source_keyframes,
-                  skeleton_frames_jpeg=skeleton_keyframes,
-                  timestamp=time.time(),
-              )
+                AlertEvent(
+                    source="vision",
+                    trigger_reason=reason,
+                    confidence=avg_conf,
+                    source_frames_jpeg=source_keyframes,
+                    skeleton_frames_jpeg=skeleton_keyframes,
+                    timestamp=time.time(),
+                )
             )
             memory.clear()

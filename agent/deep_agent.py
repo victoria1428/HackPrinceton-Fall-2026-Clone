@@ -23,6 +23,7 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 from agent.tools.emergency_tools import dispatch_emergency_call, lookup_emergency_contacts
+from agent.cv_analyzer import RoboflowCVAnalyzer
 
 
 # --- 1. STATES & DATA STRUCTURES ---
@@ -94,6 +95,7 @@ class DeepAgent:
 
         self.frontend_url = frontend_url
         self.emergency_webhook = emergency_webhook
+        self.cv_analyzer = RoboflowCVAnalyzer()
 
         # Rolling ring-buffer of recent camera frames (populated by Vision Subagent)
         # Allows audio-only triggers ("Help!") to still attach visual context!
@@ -148,14 +150,12 @@ class DeepAgent:
         elif self.latest_frames:
             self.source_evidence_frames = list(self.latest_frames)
 
-        # 2. Gather skeleton and custom CV analyzed frames if provided
-        self.skeleton_evidence_frames = list(event.skeleton_frames_jpeg)
-        self.analyzed_evidence_frames = (
-            list(event.analyzed_frames_jpeg)
-            if event.analyzed_frames_jpeg
-            else list(self.source_evidence_frames)
-        )
-        self.last_cv_report = event.cv_model_report
+        # 2. Run Roboflow CV Analyzer on the source frames if not already provided
+        if event.cv_model_report is not None:
+            self.last_cv_report = event.cv_model_report
+        elif self.source_evidence_frames:
+            self.last_cv_report = await self.cv_analyzer.analyze_frames(self.source_evidence_frames)
+            event.cv_model_report = self.last_cv_report
 
         # 3. Choose the best frames to send to Gemini (analyzed frames first, then source frames)
         frames_for_gemini = (
