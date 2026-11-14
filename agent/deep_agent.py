@@ -65,7 +65,7 @@ class DeepAgent:
 
         # 1. Official Google Gen AI SDK client (Fast Multimodal Frame + Audio Triage)
         self.gemini_client = genai.Client(api_key=api_key)
-        self.model_id = "gemini-2.5-flash"
+        self.model_id = "gemini-3.8-flash"
 
         # 2. LangChain DeepAgent (Autonomous Contact Lookup & Emergency Dispatch)
         self.llm = ChatGoogleGenerativeAI(
@@ -303,7 +303,7 @@ class DeepAgent:
             await proc.wait()
         except FileNotFoundError:
             # Fallback when testing on Windows laptop without espeak-ng installed
-            print(f"🔊 [TTS SPEAKER]: {text}")
+            print(f"[TTS SPEAKER]: {text}")
             await asyncio.sleep(2.0)
 
     async def _push_to_frontend(self, reason: str):

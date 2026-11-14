@@ -10,7 +10,7 @@ if str(ROOT_DIR) not in sys.path:
 
 from agent.deep_agent import AgentState, AlertEvent, DeepAgent
 
-DISTRESS_KEYWORDS = ("help", "emergency", "fallen", "hurt", "call 911", "can't get up")
+DISTRESS_KEYWORDS = ("help", "emergency", "fallen", "hurt", "call", "911", "can't get up")
 
 
 async def audio_interpreter_loop(agent: DeepAgent, raw_audio_queue: asyncio.Queue):
