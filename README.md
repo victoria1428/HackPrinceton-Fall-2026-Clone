@@ -6,7 +6,7 @@ Group members Format:
 Name (Discord user)
 
 Group members
-Joshua (trixler_329)
-Victoria (uv3p3)
-Sujin (s_shk_)
+Joshua (trixler_329);
+Victoria (uv3p3);
+Sujin (s_shk_);
 Martin (theothermartintm)
