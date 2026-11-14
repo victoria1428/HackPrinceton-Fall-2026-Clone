@@ -2,10 +2,16 @@ import asyncio
 import base64
 import json
 import time
-from enum import Enum, auto
+import uuid
 from dataclasses import dataclass
+from enum import Enum, auto
 from typing import Optional
-import aiohttp  # pip install aiohttp
+
+import aiohttp
+from google import genai
+from google.genai import types
+from pydantic import BaseModel
+
 
 # --- 1. STATES & DATA STRUCTURES ---
 
@@ -15,6 +21,7 @@ class AgentState(Enum):
     CHALLENGING = auto()
     AWAITING_RESPONSE = auto()
     ESCALATING = auto()
+
 
 @dataclass
 class AlertEvent:
@@ -26,34 +33,44 @@ class AlertEvent:
     timestamp: float = 0.0
 
 
+class EmergencyDecision(BaseModel):
+    is_emergency: bool
+    confidence: float
+    reasoning: str
+
+
 # --- 2. DEEP AGENT ORCHESTRATOR ---
 
 class DeepAgent:
     def __init__(self, api_key: str, frontend_url: str, emergency_webhook: str):
         self.state = AgentState.MONITORING
         self.event_queue: asyncio.Queue[AlertEvent] = asyncio.Queue()
-        
+
         # Synchronization flag: When cleared, Audio Subagent drops all incoming mic data
         self.mic_enabled = asyncio.Event()
-        self.mic_enabled.set() 
-        
-        self.api_key = api_key
+        self.mic_enabled.set()
+
+        # Official Google Gen AI SDK client
+        self.gemini_client = genai.Client(api_key=api_key)
+        self.model_id = "gemini-3.8-flash"
+
         self.frontend_url = frontend_url
         self.emergency_webhook = emergency_webhook
-        
-        # Store evidence frames for the frontend sanity check
+
+        # Evidence frames and session tracking for the sanity-check frontend
         self.evidence_frames: list[bytes] = []
         self.response_timeout_sec = 8.0
+        self._active_challenge_id: Optional[str] = None
 
     async def run(self):
         """Main decision loop for the Deep Agent."""
-        print("[DeepAgent] Online. State: MONITORING")
+        print("[DeepAgent] Online (Gemini 3.8 Flash). State: MONITORING")
         while True:
             event = await self.event_queue.get()
-            
+
             if self.state == AgentState.MONITORING:
                 await self._handle_monitoring_event(event)
-                
+
             elif self.state == AgentState.AWAITING_RESPONSE:
                 await self._handle_response_event(event)
 
@@ -65,75 +82,81 @@ class DeepAgent:
         if event.frame_jpeg:
             self.evidence_frames = [event.frame_jpeg]
 
-        # Query Cloud VLM for high-level reasoning
+        # Query Gemini for multimodal verification
         decision = await self._query_cloud_model(event)
-        
-        if decision.get("is_emergency") and decision.get("confidence", 0) >= 0.75:
-            print(f"[DeepAgent] Cloud confirmed potential emergency: {decision.get('reasoning')}")
+
+        if decision.get("is_emergency") and decision.get("confidence", 0.0) >= 0.75:
+            print(f"[DeepAgent] Gemini confirmed potential emergency: {decision.get('reasoning')}")
             await self._initiate_speaker_challenge()
         else:
-            print("[DeepAgent] Cloud dismissed alert as false alarm. Returning to MONITORING.")
+            print(f"[DeepAgent] Gemini dismissed alert ({decision.get('reasoning')}). Returning to MONITORING.")
             self.evidence_frames.clear()
             self.state = AgentState.MONITORING
 
     async def _initiate_speaker_challenge(self):
         """Mutes mic, speaks prompt via speaker, unmutes mic, and starts timeout timer."""
         self.state = AgentState.CHALLENGING
-        
+        challenge_id = str(uuid.uuid4())
+        self._active_challenge_id = challenge_id
+
         # 1. Turn off mic ingestion so speaker output doesn't trigger audio subagent
         self.mic_enabled.clear()
         print("[DeepAgent] Mic MUTED. Playing audio check-in...")
-        
-        # 2. Execute TTS Subagent (replace with your pyttsx3 / edge-tts / aplay subprocess)
+
+        # 2. Execute TTS Subagent
         await self._speak("Are you okay? Please say I am fine if you do not need help.")
-        
+
         # Brief buffer so room echo fades before mic turns back on
         await asyncio.sleep(0.4)
-        
+
         # 3. Turn mic back on and listen for response
         self.mic_enabled.set()
         self.state = AgentState.AWAITING_RESPONSE
         print(f"[DeepAgent] Mic UNMUTED. Waiting {self.response_timeout_sec}s for response...")
-        
-        # Launch non-blocking timeout watcher
-        asyncio.create_task(self._response_timeout_watcher())
 
-    async def _response_timeout_watcher(self):
+        # Launch non-blocking timeout watcher tied to this specific challenge ID
+        asyncio.create_task(self._response_timeout_watcher(challenge_id))
+
+    async def _response_timeout_watcher(self, challenge_id: str):
         """Escalates if the user fails to respond within the window."""
         await asyncio.sleep(self.response_timeout_sec)
-        
-        # Only escalate if we are STILL waiting (i.e., user didn't say "I'm fine")
-        if self.state == AgentState.AWAITING_RESPONSE:
+
+        # Only escalate if we are STILL waiting on this exact challenge session
+        if (
+            self.state == AgentState.AWAITING_RESPONSE
+            and self._active_challenge_id == challenge_id
+        ):
             print("[DeepAgent] No response detected within window!")
             await self._escalate_emergency("Unresponsive after verbal check-in.")
 
     async def _handle_response_event(self, event: AlertEvent):
-        """Evaluates audio/vision updates while waiting for the person to reply."""
+        """Evaluates audio updates while waiting for the person to reply."""
         if event.source == "audio" and event.transcript:
-            # Check if the person said they are okay (you can also pass this to the LLM)
             text = event.transcript.lower()
             if any(phrase in text for phrase in ["i'm okay", "i am okay", "i'm fine", "all good"]):
                 print("[DeepAgent] User confirmed they are okay. Resetting.")
+                self._active_challenge_id = None
                 self.evidence_frames.clear()
                 self.state = AgentState.MONITORING
             else:
                 print(f"[DeepAgent] Distress/unclear audio heard: '{text}'. Escalating.")
+                self._active_challenge_id = None
                 await self._escalate_emergency(f"Distress response: {text}")
 
     async def _escalate_emergency(self, reason: str):
         self.state = AgentState.ESCALATING
         print(f"🚨 [DeepAgent] ESCALATING EMERGENCY: {reason}")
-        
-        # 1. Speak confirmation to person
+
+        # 1. Speak confirmation to person (keep mic muted during playback)
         self.mic_enabled.clear()
         await self._speak("Contacting emergency services now. Help is on the way.")
-        
+
         # 2. Send frames + telemetry to Frontend Sanity Check & trigger Phone Demo
         await asyncio.gather(
             self._push_to_frontend(reason),
-            self._trigger_emergency_call(reason)
+            self._trigger_emergency_call(reason),
         )
-        
+
         # Cooldown before resetting for next hackathon demo run
         await asyncio.sleep(10)
         self.mic_enabled.set()
@@ -141,32 +164,60 @@ class DeepAgent:
         self.state = AgentState.MONITORING
         print("[DeepAgent] System reset for next demo.")
 
-    # --- SUBAGENT & EXTERNAL API HOOKS ---
+    # --- GEMINI REASONING & SUBAGENT HOOKS ---
 
     async def _query_cloud_model(self, event: AlertEvent) -> dict:
         """
-        Sends frame + context to your cloud VLM. 
-        Force JSON output so the Deep Agent can parse it deterministically.
+        Sends frame + sensor context to Gemini using native async (client.aio)
+        and structured Pydantic output.
         """
-        b64_img = base64.b64encode(event.frame_jpeg).decode("utf-8") if event.frame_jpeg else None
-        
-        # Replace with your chosen provider's endpoint (Gemini, OpenAI, Anthropic)
         prompt = (
-            "You are an emergency triage vision/audio analyzer. "
-            f"Local sensor trigger: {event.trigger_reason}. Transcript: '{event.transcript}'. "
-            "Analyze the image and context. Determine if a person has collapsed, fallen, or is in distress. "
-            "Respond ONLY in valid JSON: {\"is_emergency\": bool, \"confidence\": float, \"reasoning\": str}"
+            "You are an emergency triage vision and audio analyzer for an autonomous safety monitor. "
+            f"Local sensor trigger: {event.trigger_reason}. "
+            f"Audio transcript: '{event.transcript or 'None'}'. "
+            "Analyze the attached camera frame (if provided) and the sensor trigger. "
+            "Determine if a person has collapsed on the ground, appears unresponsive/injured, "
+            "or is calling for help."
         )
-        # Mock return for structural clarity — wire your HTTP POST to the model API here
-        await asyncio.sleep(0.5) 
-        return {"is_emergency": True, "confidence": 0.92, "reasoning": "Person lying motionless on floor."}
+
+        contents: list = [prompt]
+        if event.frame_jpeg:
+            contents.append(
+                types.Part.from_bytes(
+                    data=event.frame_jpeg,
+                    mime_type="image/jpeg",
+                )
+            )
+
+        try:
+            response = await self.gemini_client.aio.models.generate_content(
+                model=self.model_id,
+                contents=contents,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    response_schema=EmergencyDecision,
+                    temperature=0.1,
+                ),
+            )
+            if not response.text:
+                raise ValueError("Gemini returned an empty response.")
+            return json.loads(response.text)
+
+        except Exception as e:
+            print(f"[DeepAgent] Gemini API Error: {e}")
+            # Fail-safe fallback if hackathon Wi-Fi drops
+            return {
+                "is_emergency": event.confidence >= 0.85,
+                "confidence": event.confidence,
+                "reasoning": f"Fallback to edge confidence due to API error: {e}",
+            }
 
     async def _speak(self, text: str):
-        """Non-blocking wrapper around Raspberry Pi TTS (e.g., espeak-ng or piper)."""
+        """Non-blocking wrapper around Raspberry Pi TTS (espeak-ng)."""
         proc = await asyncio.create_subprocess_exec(
             "espeak-ng", "-s", "150", text,
             stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL
+            stderr=asyncio.subprocess.DEVNULL,
         )
         await proc.wait()
 
@@ -176,11 +227,11 @@ class DeepAgent:
             "status": "EMERGENCY_DISPATCHED",
             "reason": reason,
             "timestamp": time.time(),
-            "frames_b64": [base64.b64encode(f).decode("utf-8") for f in self.evidence_frames]
+            "frames_b64": [base64.b64encode(f).decode("utf-8") for f in self.evidence_frames],
         }
         async with aiohttp.ClientSession() as session:
             try:
-                await session.post(self.frontend_url, json=payload, timeout=5)
+                await session.post(self.frontend_url, json=payload, timeout=aiohttp.ClientTimeout(total=5))
                 print("[DeepAgent] Frames pushed to frontend.")
             except Exception as e:
                 print(f"[DeepAgent] Frontend push failed: {e}")
@@ -189,7 +240,11 @@ class DeepAgent:
         """Hits Twilio / webhook to dial demo phone."""
         async with aiohttp.ClientSession() as session:
             try:
-                await session.post(self.emergency_webhook, json={"alert": reason}, timeout=5)
+                await session.post(
+                    self.emergency_webhook,
+                    json={"alert": reason},
+                    timeout=aiohttp.ClientTimeout(total=5),
+                )
                 print("[DeepAgent] Emergency call webhook triggered.")
             except Exception as e:
                 print(f"[DeepAgent] Call trigger failed: {e}")

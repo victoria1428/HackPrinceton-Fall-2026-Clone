@@ -1,6 +1,6 @@
 import asyncio
-import time
 import sys
+import time
 from pathlib import Path
 
 # Ensures 'HackPrinceton Fall 2026' is on the path if you run this file directly
@@ -13,11 +13,11 @@ from agent.deep_agent import AgentState, AlertEvent, DeepAgent
 async def audio_interpreter_loop(agent: DeepAgent, raw_audio_queue: asyncio.Queue):
     while True:
         transcript, confidence = await raw_audio_queue.get()
-        
+
         # Strictly ignore all audio while the speaker is talking
         if not agent.mic_enabled.is_set():
             continue
-            
+
         # During MONITORING, only escalate on distress keywords
         if agent.state == AgentState.MONITORING:
             if any(word in transcript.lower() for word in ["help", "emergency", "fallen", "hurt"]):
@@ -28,7 +28,7 @@ async def audio_interpreter_loop(agent: DeepAgent, raw_audio_queue: asyncio.Queu
                     transcript=transcript,
                     timestamp=time.time()
                 ))
-        
+
         # During AWAITING_RESPONSE, forward ANY speech so the Deep Agent can evaluate it
         elif agent.state == AgentState.AWAITING_RESPONSE:
             await agent.event_queue.put(AlertEvent(
