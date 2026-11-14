@@ -55,7 +55,7 @@ def dispatch_emergency_call(phone_number: str, contact_name: str, incident_summa
             client.messages.create(
                 to=phone_number,
                 from_=from_number,
-                body=f"🚨 EMERGENCY ALERT ({contact_name}): {incident_summary}",
+                body=f"EMERGENCY ALERT ({contact_name}): {incident_summary}",
             )
             return f"Twilio call (SID: {call.sid}) and SMS dispatched to {contact_name} at {phone_number}."
         except Exception as e:
